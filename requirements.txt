@@ -1,0 +1,16 @@
+torch>=2.1.0
+transformers>=4.36.0
+peft>=0.7.0
+bitsandbytes>=0.41.0
+accelerate>=0.25.0
+pandas
+numpy
+scikit-learn
+seaborn
+matplotlib
+tqdm
+openai  # For generating labels
+jupyter
+datasets
+
+
