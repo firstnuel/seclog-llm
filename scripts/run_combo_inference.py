@@ -119,8 +119,9 @@ def load_sec_logllm(stage1_adapter: Path, stage3_checkpoint: Path) -> SecLogLLM:
     else:
         print("WARNING: No decoder_lora_state in checkpoint, using Stage 1 LoRA only!")
 
-    model.encoder.to(dtype=decoder_dtype)
-    model.projector.to(dtype=decoder_dtype)
+    # Ensure consistent dtype after loading (training may have saved as bfloat16)
+    model.encoder.to(dtype=torch.float32)
+    model.projector.to(dtype=torch.float32)
 
     return model
 
