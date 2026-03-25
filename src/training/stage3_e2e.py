@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=ExperimentConfig().stages["stage3"].batch_size)
     parser.add_argument("--grad-accum", type=int, default=ExperimentConfig().stages["stage3"].gradient_accumulation_steps)
     parser.add_argument("--learning-rate", type=float, default=ExperimentConfig().stages["stage3"].learning_rate or 1e-4)
+    parser.add_argument("--save-every", type=int, default=2000, help="Save checkpoint every N optimizer steps.")
+    parser.add_argument("--resume-from", type=Path, default=None, help="Resume training from a Stage 3 checkpoint.")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--max-samples", type=int, default=None, help="Optional limit for debugging.")
     return parser.parse_args()
@@ -79,6 +81,21 @@ def set_lora_trainable(model: torch.nn.Module) -> int:
         if requires_grad:
             trainable += param.numel()
     return trainable
+
+
+def save_checkpoint(model, config, output_dir, tag, global_step):
+    path = output_dir / f"stage3_{tag}.pt"
+    torch.save(
+        {
+            "encoder_state": model.encoder.state_dict(),
+            "projector_state": model.projector.state_dict(),
+            "decoder_lora_state": model.decoder_model.state_dict(),
+            "config": config.sec_logllm,
+            "global_step": global_step,
+        },
+        path,
+    )
+    print(f"\n  💾 Saved checkpoint: {path}")
 
 
 def main() -> None:
@@ -108,9 +125,23 @@ def main() -> None:
     model = SecLogLLM(config.sec_logllm)
     model.decoder_model = peft_decoder
 
-    checkpoint = torch.load(args.stage2_checkpoint, map_location="cpu",  weights_only=False)
-    model.encoder.load_state_dict(checkpoint["encoder_state"])
-    model.projector.load_state_dict(checkpoint["projector_state"])
+    # Load weights: either resume from Stage 3 checkpoint or start from Stage 2
+    if args.resume_from:
+        print(f"Resuming from {args.resume_from}")
+        resume_ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        model.encoder.load_state_dict(resume_ckpt["encoder_state"])
+        model.projector.load_state_dict(resume_ckpt["projector_state"])
+        if "decoder_lora_state" in resume_ckpt:
+            model.decoder_model.load_state_dict(resume_ckpt["decoder_lora_state"], strict=False)
+            print(f"  Loaded decoder LoRA from resume checkpoint")
+        resume_step = resume_ckpt.get("global_step", 0)
+        del resume_ckpt
+    else:
+        checkpoint = torch.load(args.stage2_checkpoint, map_location="cpu", weights_only=False)
+        model.encoder.load_state_dict(checkpoint["encoder_state"])
+        model.projector.load_state_dict(checkpoint["projector_state"])
+        resume_step = 0
+        del checkpoint
 
     model.freeze_encoder()
     for param in model.projector.parameters():
@@ -130,20 +161,28 @@ def main() -> None:
         weight_decay=config.optimizer.weight_decay,
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
-    global_step = 0
+    scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+    global_step = resume_step
+    steps_to_skip = resume_step * args.grad_accum  # dataloader steps to skip
+    if resume_step > 0:
+        print(f"  Resuming from global_step={resume_step}, skipping {steps_to_skip} dataloader steps")
 
     for epoch in range(args.epochs):
         model.train()
         progress = tqdm(dataloader, desc=f"Stage 3 Epoch {epoch+1}/{args.epochs}")
         optimizer.zero_grad()
         for step, batch in enumerate(progress):
+            # Skip already-processed steps when resuming
+            if step < steps_to_skip:
+                if step % 1000 == 0 and step > 0:
+                    progress.set_postfix({"skipping": f"{step}/{steps_to_skip}"})
+                continue
             log_sequences = batch["log_sequences"]
             labels = batch["labels"]
             metadata = batch["metadata"]
             targets = format_targets(labels, metadata)
 
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
                 outputs = model(log_sequences=log_sequences, target_texts=targets)
                 loss = outputs.decoder_outputs.loss
 
@@ -156,22 +195,25 @@ def main() -> None:
                 scaler.update()
                 optimizer.zero_grad()
                 global_step += 1
-                progress.set_postfix({"loss": loss.item(), "step": global_step})
 
-        checkpoint_path = args.output_dir / f"stage3_epoch_{epoch+1}.pt"
-        torch.save(
-            {
-                "encoder_state": model.encoder.state_dict(),
-                "projector_state": model.projector.state_dict(),
-                "decoder_lora_state": model.decoder_model.state_dict(),
-                "config": config.sec_logllm,
-                "global_step": global_step,
-            },
-            checkpoint_path,
-        )
+                alpha_mean = outputs.alphas.detach().mean().item()
+                progress.set_postfix({"loss": loss.item(), "α": f"{alpha_mean:.4f}", "step": global_step})
+
+                # Periodic checkpoint
+                if global_step % args.save_every == 0:
+                    save_checkpoint(model, config, args.output_dir, f"step_{global_step}", global_step)
+
+            # Free memory to prevent OOM buildup
+            del outputs, loss
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # End-of-epoch checkpoint
+        save_checkpoint(model, config, args.output_dir, f"epoch_{epoch+1}", global_step)
 
     print(f"Stage 3 complete! Saved checkpoints to {args.output_dir}")
 
 
 if __name__ == "__main__":
     main()
+
