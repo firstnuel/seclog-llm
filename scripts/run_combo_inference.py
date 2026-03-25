@@ -75,8 +75,20 @@ def parse_response(response: str) -> tuple[dict, bool, str | None]:
         if isinstance(payload, dict):
             return payload, True, None
         return {"raw_response": response}, False, "response_json_is_not_object"
+    except json.JSONDecodeError:
+        pass
+
+    # Fix common model output: missing closing quote on keys (e.g. "mitre_t_code: null)
+    import re
+    fixed = re.sub(r'"(\w+):\s', r'"\1": ', trimmed)
+    try:
+        payload = json.loads(fixed)
+        if isinstance(payload, dict):
+            return payload, True, None
     except json.JSONDecodeError as exc:
         return {"raw_response": response}, False, f"json_decode_error: {exc.msg}"
+
+    return {"raw_response": response}, False, "json_decode_error: unfixable"
 
 
 def load_sec_logllm(stage1_adapter: Path, stage3_checkpoint: Path) -> SecLogLLM:
